@@ -427,7 +427,7 @@ COPY --chmod=0755 docker/entrypoint-dispatch.sh /opt/hermes/docker/entrypoint-di
 # every other consumer.
 ENV PATH="/opt/hermes/bin:/opt/hermes/.venv/bin:/opt/data/.local/bin:${PATH}"
 RUN mkdir -p /opt/data
-VOLUME [ "/opt/data" ]
+# VOLUME [ "/opt/data" ]  # Railway 不支援 Dockerfile VOLUME 指令；改用已掛好的 Railway Volume（/opt/data，效果相同）
 
 # The image ENTRYPOINT is a tiny dispatcher rather than `/init` directly.
 # When the image really owns PID 1 (normal Docker / Podman), the dispatcher
