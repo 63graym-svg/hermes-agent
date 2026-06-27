@@ -111,6 +111,46 @@ LINE_BOT_INFO_URL = "https://api.line.me/v2/bot/info"
 LINE_PER_BUBBLE_CHARS = 5000  # Hard limit per text message object
 LINE_SAFE_BUBBLE_CHARS = 4500  # Conservative limit for chunking
 LINE_MAX_MESSAGES_PER_CALL = 5  # API rejects >5 messages per Reply/Push
+
+# ── Gate①：群組遮金額（移植自靜靜後端 money.ts 平衡版）──────────────────────
+# 本人(OWNER_USER_ID)私訊給完整金額；群組/房間/他人一律遮「有金額訊號」的數字。
+import os as _os_money, re as _re_money
+
+_MONEY_MASK = "[金額已隱藏]"
+_CN_NUM = "零一二三四五六七八九十百千兩壹貳參叄肆伍陸柒捌玖拾佰仟"
+_MONEY_KW = ("報價|含稅|未稅|總價|單價|金額|訂金|尾款|預算|費用|成本|售價|價格|"
+             "收費|抽成|佣金|毛利|稅金|押金|月租|日租|時薪|日薪")
+_MRE1 = _re_money.compile(r'(?:NT|US|RMB|HK)?\$\s*[\d,.]+(?:\s*(?:萬|億|[kKmM]))?')
+_MRE2 = _re_money.compile(r'(' + _MONEY_KW + r')\s*[:：]?\s*[\d,.]+(?:\s*(?:元|塊|萬|億|[kKmM]))?')
+_MRE3 = _re_money.compile(r'[\d,.]+\s*(?:元|塊|萬|億|圓|NT|台幣|美金|鎂|人民幣)')
+_MRE3B = _re_money.compile(r'[' + _CN_NUM + r']+(?:萬|億)[' + _CN_NUM + r']*(?:元|塊|圓)?|[' + _CN_NUM + r']+(?:元|塊|圓)')
+_MRE4 = _re_money.compile(r'\d{1,3}(?:,\d{3})+(?:\.\d+)?')
+
+
+def _mask_money_for_group(text):
+    if not text:
+        return text
+    s = text
+    s = _MRE1.sub(_MONEY_MASK, s)
+    s = _MRE2.sub(lambda m: m.group(1) + _MONEY_MASK, s)
+    s = _MRE3.sub(_MONEY_MASK, s)
+    s = _MRE3B.sub(_MONEY_MASK, s)
+    s = _MRE4.sub(_MONEY_MASK, s)
+    return s
+
+
+def _mask_money_for_chat(chat_id, content):
+    """本人私訊(chat_id==OWNER_USER_ID)給完整金額；其餘(群組C/房間R/他人U)一律遮。
+    OWNER_USER_ID 未設時 fail-safe：當作沒有本人 → 全遮（寧可遮錯也不外洩）。"""
+    try:
+        owner = (_os_money.environ.get("OWNER_USER_ID", "") or "").strip()
+        if owner and chat_id == owner:
+            return content
+        return _mask_money_for_group(content)
+    except Exception:
+        return _mask_money_for_group(content)
+# ────────────────────────────────────────────────────────────────────────────
+
 LINE_REPLY_TOKEN_TTL_SECONDS = 50  # Conservative cap below LINE's ~60s
 
 # Webhook hardening
@@ -1086,6 +1126,9 @@ class LineAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
 
+        # Gate①：群組遮金額（本人私訊不遮）
+        content = _mask_money_for_chat(chat_id, content)
+
         # System busy-acks (interrupting / queued / steered) bypass the
         # postback cache and route directly to LINE so they reach the user
         # as visible bubbles. Source: PR #18153.
@@ -1110,6 +1153,8 @@ class LineAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if not self._client:
             return SendResult(success=False, error="LINE adapter not connected")
+
+        content = _mask_money_for_chat(chat_id, content)
 
         chunks = split_for_line(strip_markdown_preserving_urls(content))
         if not chunks:
