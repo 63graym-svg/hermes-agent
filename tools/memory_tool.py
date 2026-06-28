@@ -578,6 +578,20 @@ class MemoryStore:
 
         Returns None if the snapshot is empty (no entries at load time).
         """
+        # 安全閘門：USER PROFILE / MEMORY(主人私密畫像與筆記) 只在主人本人 session
+        # 注入。非本人(群組成員/陌生人)的 session 一律不帶，避免主人個資經 LLM 外洩。
+        # 身份取自 gateway 的 in-process contextvar(LLM 改不了)；取不到(本機/cron)則放行。
+        if target in ("user", "memory"):
+            try:
+                import os as _os
+                from gateway.session_context import get_session_env as _gse
+                _caller = (_gse("HERMES_SESSION_USER_ID", "") or "").strip()
+                _platform = (_gse("HERMES_SESSION_PLATFORM", "") or "").strip()
+                _owner = (_os.environ.get("OWNER_USER_ID", "") or "").strip()
+                if _platform and _caller and _owner and _caller != _owner:
+                    return None
+            except Exception:
+                pass
         block = self._system_prompt_snapshot.get(target, "")
         return block if block else None
 

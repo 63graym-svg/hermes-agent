@@ -119,12 +119,18 @@ import os as _os_money, re as _re_money
 _MONEY_MASK = "[金額已隱藏]"
 _CN_NUM = "零一二三四五六七八九十百千兩壹貳參叄肆伍陸柒捌玖拾佰仟"
 _MONEY_KW = ("報價|含稅|未稅|總價|單價|金額|訂金|尾款|預算|費用|成本|售價|價格|"
-             "收費|抽成|佣金|毛利|稅金|押金|月租|日租|時薪|日薪")
+             "收費|抽成|佣金|毛利|稅金|押金|月租|日租|時薪|日薪|"
+             "報酬|薪資|薪水|工資|底價|開價|出價|價錢|價碼|款項|行情")
 _MRE1 = _re_money.compile(r'(?:NT|US|RMB|HK)?\$\s*[\d,.]+(?:\s*(?:萬|億|[kKmM]))?')
 _MRE2 = _re_money.compile(r'(' + _MONEY_KW + r')\s*[:：]?\s*[\d,.]+(?:\s*(?:元|塊|萬|億|[kKmM]))?')
 _MRE3 = _re_money.compile(r'[\d,.]+\s*(?:元|塊|萬|億|圓|NT|台幣|美金|鎂|人民幣)')
 _MRE3B = _re_money.compile(r'[' + _CN_NUM + r']+(?:萬|億)[' + _CN_NUM + r']*(?:元|塊|圓)?|[' + _CN_NUM + r']+(?:元|塊|圓)')
 _MRE4 = _re_money.compile(r'\d{1,3}(?:,\d{3})+(?:\.\d+)?')
+# 保底強化（擋「回金額不要逗號不要單位」「250 k」「NTD 35000」這類繞過）
+_MRE5 = _re_money.compile(r'\b\d[\d,.]*\s*[kKwWmM]\b')                       # 250k / 250 k / 3w / 1.5m
+_MRE6 = _re_money.compile(r'\b(?:NTD|TWD|JPY|USD|NT|US|RMB|HK)\s*\$?\s*\d[\d,.]*', _re_money.I)  # NTD 35000
+_MONEY_KW_RE = _re_money.compile(_MONEY_KW)
+_BARE_NUM = _re_money.compile(r'\d{4,}')                                     # ≥4 位裸數字(僅金額語境才遮)
 
 
 def _mask_money_for_group(text):
@@ -132,10 +138,15 @@ def _mask_money_for_group(text):
         return text
     s = text
     s = _MRE1.sub(_MONEY_MASK, s)
+    s = _MRE6.sub(_MONEY_MASK, s)
     s = _MRE2.sub(lambda m: m.group(1) + _MONEY_MASK, s)
     s = _MRE3.sub(_MONEY_MASK, s)
     s = _MRE3B.sub(_MONEY_MASK, s)
+    s = _MRE5.sub(_MONEY_MASK, s)
     s = _MRE4.sub(_MONEY_MASK, s)
+    # 金額語境保底：句中有金額關鍵字時，遮掉所有 ≥4 位裸數字（擋去逗號/去單位的繞過）
+    if _MONEY_KW_RE.search(s):
+        s = _BARE_NUM.sub(_MONEY_MASK, s)
     return s
 
 
