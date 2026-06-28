@@ -197,6 +197,9 @@ COPY . .
 # resolution or downloads.
 RUN uv pip install --no-cache-dir --no-deps -e "."
 
+# 眾力業務：PDF/Word/Excel 文件讀取（ocr-and-documents skill 依賴 pymupdf；docx/xlsx 解析）
+RUN uv pip install --no-cache-dir pymupdf python-docx openpyxl
+
 # Keep /opt/hermes immutable for the runtime hermes user. Hosted/container
 # instances must not be able to self-edit the installed source or venv; user
 # data, skills, plugins, config, logs, and dashboard uploads live under
