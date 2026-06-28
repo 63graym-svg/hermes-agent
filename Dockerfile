@@ -291,6 +291,9 @@ COPY --link --chmod=a+rX,go-w . .
 # resolution or downloads.
 RUN uv pip install --no-cache-dir --no-deps -e "."
 
+# 眾力業務：PDF/Word/Excel 文件讀取（ocr-and-documents skill 依賴 pymupdf；docx/xlsx 解析）
+RUN uv pip install --no-cache-dir pymupdf python-docx openpyxl
+
 # Wire the exec shim and install-method stamp.  Files under /opt/hermes are
 # already root-owned (COPY, uv sync, npm install all run as root) and
 # read-only for the hermes user (go-w from the --chmod above).
