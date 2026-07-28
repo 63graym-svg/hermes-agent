@@ -677,6 +677,26 @@ def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices:
                 sort_keys=True,
             )
             slot = tool_call_indices.get(call_key)
+            # `part_index` restarts at 0 for every SSE event, so two DISTINCT
+            # calls to the SAME tool in one turn collide on `call_key` when
+            # they arrive in separate events (same part_index, same name, and
+            # usually no thoughtSignature).  Sharing one slot made the second
+            # call's complete arguments get appended to the first call's,
+            # yielding concatenated JSON ('{"a": 1}{"b": 2}') that is
+            # unrepairable downstream — the tool silently never runs and the
+            # turn is misreported as an output-length truncation.
+            # Reuse a slot only when the incoming arguments are a re-send
+            # (identical) or an extension (prefix) of what it already holds;
+            # otherwise walk a suffixed key chain to a fresh slot so each call
+            # keeps its own index/id and its own complete JSON.
+            # Upstream issue: NousResearch/hermes-agent#57939
+            while slot is not None:
+                previous_arguments = str(slot.get("last_arguments") or "")
+                if previous_arguments and not args_str.startswith(previous_arguments):
+                    call_key += "#dup"
+                    slot = tool_call_indices.get(call_key)
+                else:
+                    break
             if slot is None:
                 slot = {
                     "index": len(tool_call_indices),
