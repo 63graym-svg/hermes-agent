@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -27,6 +28,48 @@ from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# 眾力/靜靜：群組情境使用獨立記憶 peer
+# ---------------------------------------------------------------------------
+# Honcho 的 conclusions 是「按人(peer)」存的。LINE adapter 對群組事件送出的
+# ``user_id`` 是「發話者的 LINE userId」，與該人私訊時的 userId 完全相同，
+# 於是群組裡蒸餾出來的結論會直接寫進他私訊用的同一個記憶池。
+# 實測(2026-08-02)：主人畫像 ``owner=>owner`` 682 筆裡有 240 筆(35.2%)來自群組
+# session，其中一組是「別人在群組設定家裡電視用的 Google 帳號密碼」被 honcho
+# 記成「主人本人的屬性」，每次私訊都可能被注入。
+#
+# 這裡只改「記憶 peer id 的推導」。身份硬擋(OWNER_USER_ID 比對)、co-owner 名單、
+# 遮金額(吃 chat_id)、群組 @ 觸發、訊息留痕、群組白名單全部讀 gateway 的
+# ``Source`` 物件，不經過這個函式，因此完全不受影響。
+# session key 也不受影響：``_resolve_session_key`` 只吃 session_title /
+# session_id / gateway_session_key。
+#
+# 開關 ``JINGJING_SPLIT_GROUP_MEMORY``（預設開啟）：設成 0/false/no/off 即可關掉，
+# 行為與本改動前完全相同，且**不需要 rebuild**（改 Railway 變數重啟即可）。
+_GROUP_CHAT_TYPES = {"group", "room", "channel", "supergroup"}
+_SPLIT_GROUP_PEER_SUFFIX = "-grp"
+_SPLIT_GROUP_OFF_VALUES = {"0", "false", "no", "off"}
+
+
+def _split_group_peer_name(user_id: Any, chat_type: Any) -> Optional[str]:
+    """Return the memory peer name for ``user_id``, suffixed in group chats.
+
+    DM / CLI / cron paths return ``user_id`` unchanged.
+    """
+    if not user_id:
+        return None
+    try:
+        flag = str(os.environ.get("JINGJING_SPLIT_GROUP_MEMORY", "1")).strip().lower()
+        if flag in _SPLIT_GROUP_OFF_VALUES:
+            return user_id
+        if str(chat_type or "").strip().lower() not in _GROUP_CHAT_TYPES:
+            return user_id
+        return f"{user_id}{_SPLIT_GROUP_PEER_SUFFIX}"
+    except Exception:
+        # Fail open to the pre-existing behaviour: never lose memory over this.
+        return user_id
 
 
 # ---------------------------------------------------------------------------
@@ -437,8 +480,12 @@ class HonchoMemoryProvider(MemoryProvider):
             honcho=client,
             config=cfg,
             context_tokens=cfg.context_tokens,
-            runtime_user_peer_name=kwargs.get("user_id") or None,
-            runtime_user_peer_name_alt=kwargs.get("user_id_alt") or None,
+            runtime_user_peer_name=_split_group_peer_name(
+                kwargs.get("user_id") or None, kwargs.get("chat_type")
+            ),
+            runtime_user_peer_name_alt=_split_group_peer_name(
+                kwargs.get("user_id_alt") or None, kwargs.get("chat_type")
+            ),
         )
 
         # ----- B3: resolve_session_name -----
