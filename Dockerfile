@@ -294,6 +294,10 @@ RUN uv pip install --no-cache-dir --no-deps -e "."
 # 眾力業務：PDF/Word/Excel 文件讀取（ocr-and-documents skill 依賴 pymupdf；docx/xlsx 解析）
 RUN uv pip install --no-cache-dir pymupdf python-docx openpyxl
 
+# 靜靜語音訊息轉文字（LINE voice→STT，LU 2026-08-28 拍板開通）。
+# 模型檔 first-use 下載到 HF cache＝/opt/data/.cache（hermes HOME 在 Volume）→ 重建不重抓。
+RUN uv pip install --no-cache-dir faster-whisper
+
 # Wire the exec shim and install-method stamp.  Files under /opt/hermes are
 # already root-owned (COPY, uv sync, npm install all run as root) and
 # read-only for the hermes user (go-w from the --chmod above).
