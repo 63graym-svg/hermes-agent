@@ -220,3 +220,67 @@ class TestGeminiInCheckRequirements:
             return_value={"provider": "gemini"},
         ), patch("builtins.__import__", side_effect=fake_import):
             assert check_tts_requirements() is True
+
+
+def _gemini_response_with(audio_bytes):
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.json.return_value = {
+        "candidates": [{"content": {"parts": [{"inlineData": {
+            "mimeType": "audio/wav",
+            "data": base64.b64encode(audio_bytes).decode(),
+        }}]}}]
+    }
+    return resp
+
+
+class TestGeminiVoiceFidelity:
+    """The live voice must match the sample it was tuned on (LINE 晨報 voice, 2026-10-09)."""
+
+    def test_complete_wav_from_gemini_is_not_wrapped_again(self, tmp_path, monkeypatch, fake_pcm_bytes):
+        from tools.tts_tool import _generate_gemini_tts, _wrap_pcm_as_wav
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        # gemini-3.8-flash-tts returns a full WAV with a trailing C2PA chunk.
+        full_wav = _wrap_pcm_as_wav(fake_pcm_bytes) + b"C2PA" + struct.pack("<I", 8) + b"\xab" * 8
+
+        with patch("requests.post", return_value=_gemini_response_with(full_wav)):
+            _generate_gemini_tts("Hi", str(tmp_path / "t.wav"), {})
+
+        data = (tmp_path / "t.wav").read_bytes()
+        assert data == full_wav
+        assert data.count(b"RIFF") == 1
+
+    def test_mp3_conversion_uses_128k(self, tmp_path, monkeypatch, mock_gemini_response):
+        from tools.tts_tool import _generate_gemini_tts
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        done = SimpleNamespace(returncode=0, stderr=b"")
+        with patch("requests.post", return_value=mock_gemini_response), \
+                patch("tools.tts_tool.shutil.which", return_value="/usr/bin/ffmpeg"), \
+                patch("tools.tts_tool.subprocess.run", return_value=done) as run:
+            _generate_gemini_tts("Hi", str(tmp_path / "t.mp3"), {})
+
+        cmd = run.call_args[0][0]
+        assert cmd[cmd.index("-b:a") + 1] == "128k"
+
+    def test_persona_preamble_false_sends_persona_exactly(self):
+        from tools.tts_tool import _compose_gemini_tts_prompt
+
+        persona = "# AUDIO PROFILE: X\n### DIRECTOR'S NOTES\nStyle: soft.\n#### TRANSCRIPT\n{{transcript}}"
+        out = _compose_gemini_tts_prompt("小灰早安", {"persona_preamble": False}, persona_prompt=persona)
+        assert out == "# AUDIO PROFILE: X\n### DIRECTOR'S NOTES\nStyle: soft.\n#### TRANSCRIPT\n小灰早安"
+
+    def test_preamble_kept_by_default(self):
+        from tools.tts_tool import _compose_gemini_tts_prompt
+
+        out = _compose_gemini_tts_prompt("hi", {}, persona_prompt="Style: soft.")
+        assert out.startswith("Synthesize speech from the TRANSCRIPT only.")
+        assert out.endswith("Style: soft.\n\n#### TRANSCRIPT\nhi")
+
+    def test_backslash_in_transcript_is_kept_literally(self):
+        from tools.tts_tool import _compose_gemini_tts_prompt
+
+        text = r"路徑 C:\new\1 \g<0>"
+        out = _compose_gemini_tts_prompt(text, {"persona_preamble": False}, persona_prompt="A\n{{transcript}}")
+        assert out == "A\n" + text

@@ -2591,6 +2591,10 @@ def _compose_gemini_tts_prompt(
         "SCENE, DIRECTOR'S NOTES, and SAMPLE CONTEXT as performance direction; "
         "do not speak those sections aloud."
     )
+    # persona_preamble: false sends the persona file exactly as written; the
+    # preamble shifts the delivery away from what the persona was tuned on.
+    if not _config_bool(gemini_config.get("persona_preamble"), default=True):
+        preamble = ""
 
     placeholder_patterns = (
         re.compile(r"\{\{\s*transcript\s*\}\}", flags=re.IGNORECASE),
@@ -2599,7 +2603,8 @@ def _compose_gemini_tts_prompt(
     prompt = persona_prompt
     for pattern in placeholder_patterns:
         if pattern.search(prompt):
-            prompt = pattern.sub(transcript, prompt)
+            # Function replacement: a backslash in the transcript is not a regex escape.
+            prompt = pattern.sub(lambda _m: transcript, prompt)
             return f"{preamble}\n\n{prompt}".strip()
 
     return f"{preamble}\n\n{persona_prompt}\n\n#### TRANSCRIPT\n{transcript}".strip()
@@ -2726,7 +2731,9 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
         raise RuntimeError("Gemini TTS returned empty audio data")
 
     pcm_bytes = base64.b64decode(audio_b64)
-    wav_bytes = _wrap_pcm_as_wav(pcm_bytes)
+    # Newer Gemini TTS models already return a complete WAV (with a trailing
+    # C2PA chunk); wrapping it again plays that metadata as noise at the end.
+    wav_bytes = pcm_bytes if pcm_bytes[:4] == b"RIFF" else _wrap_pcm_as_wav(pcm_bytes)
 
     # Fast path: caller wants WAV directly, just write.
     if output_path.lower().endswith(".wav"):
@@ -2758,7 +2765,9 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
                     output_path,
                 ]
             else:
-                cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
+                # ffmpeg's default for 24 kHz mono MP3 is 32 kbps, which smears
+                # breathy/husky voices; 128k keeps them intact.
+                cmd = [ffmpeg, "-i", wav_path, "-b:a", "128k", "-y", "-loglevel", "error", output_path]
             result = subprocess.run(cmd, capture_output=True, timeout=30, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
             if result.returncode != 0:
                 stderr = result.stderr.decode("utf-8", errors="ignore")[:300]
