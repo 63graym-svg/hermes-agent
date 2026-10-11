@@ -428,3 +428,40 @@ class TestGeminiTakes:
             _generate_gemini_tts("Hi", str(tmp_path / "t.wav"), {"gemini": {"takes": 3}})
         assert post.call_count == 2
         assert (tmp_path / "t.wav").read_bytes() == lively
+
+    def test_malformed_header_first_take_is_used_without_retakes(self):
+        from tools.tts_tool import _pick_gemini_take
+
+        bad = bytearray(_tone_wav(180, 185, tilt=1.5))
+        bad[16] = 100  # fmt chunk size: the stdlib wave reader raises a bare RuntimeError
+        bad = bytes(bad)
+        take, calls = self._takes(bad, bad, bad)
+        assert _pick_gemini_take(take, {"takes": 3}) == bad
+        assert len(calls) == 1
+
+    def test_retake_connection_error_does_not_log_the_key(self, caplog):
+        import logging
+
+        import requests
+
+        from tools.tts_tool import _pick_gemini_take
+
+        flat = _tone_wav(180, 185, tilt=1.5)
+        leak = requests.ConnectionError("HTTPSConnectionPool: /models/m:generateContent?key=SECRET-KEY-123")
+        take, calls = self._takes(flat, leak)
+        with caplog.at_level(logging.INFO):
+            assert _pick_gemini_take(take, {"takes": 3}) == flat
+        assert len(calls) == 2
+        assert "SECRET-KEY-123" not in caplog.text
+        assert "ConnectionError" in caplog.text
+
+    def test_mistyped_setting_is_logged(self, caplog):
+        import logging
+
+        from tools.tts_tool import _pick_gemini_take
+
+        flat = _tone_wav(180, 185, tilt=1.5)
+        take, calls = self._takes(flat)
+        with caplog.at_level(logging.WARNING):
+            _pick_gemini_take(take, {"takes": "three"})
+        assert "tts.gemini.takes='three'" in caplog.text

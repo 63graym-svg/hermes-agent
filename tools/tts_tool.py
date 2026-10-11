@@ -2627,14 +2627,15 @@ def _gemini_take_features(wav_bytes: bytes) -> Optional[Dict[str, float]]:
                 return None
             sr, channels = w.getframerate(), w.getnchannels()
             raw = w.readframes(w.getnframes())
-    except (wave.Error, EOFError):
+    except (wave.Error, EOFError, RuntimeError):  # wave raises a bare RuntimeError on some malformed headers
         return None
     if sr <= 0 or channels <= 0:
         return None
-    x = np.frombuffer(raw[: len(raw) - len(raw) % 2], dtype="<i2").astype(np.float64) / 32768.0
+    # Only the first 30 s are measured, which keeps memory bounded.
+    x = np.frombuffer(raw[: len(raw) - len(raw) % 2], dtype="<i2")[: sr * 30 * channels]
+    x = x.astype(np.float64) / 32768.0
     if channels > 1:
         x = x[: len(x) - len(x) % channels].reshape(-1, channels).mean(axis=1)
-    x = x[: sr * 30]  # the first 30 s are enough and keep memory bounded
     n, hop = int(sr * 0.04), int(sr * 0.01)  # 40 ms frames, 10 ms hop
     if n <= 0 or hop <= 0 or len(x) <= n:
         return None
@@ -2673,11 +2674,15 @@ def _pick_gemini_take(take: Callable[[], bytes], gemini_config: Dict[str, Any]) 
     import requests
 
     def setting(key: str, default, cast):
+        raw = gemini_config.get(key, default)
         try:
-            value = cast(gemini_config.get(key, default))
+            value = cast(raw)
         except (TypeError, ValueError, OverflowError):
+            value = None
+        if value is None or not value > 0:
+            logger.warning("tts.gemini.%s=%r is not a positive number; using %s", key, raw, default)
             return default
-        return value if value > 0 else default
+        return value
 
     first = take()
     takes = min(setting("takes", 1, int), 5)
