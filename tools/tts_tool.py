@@ -2626,13 +2626,17 @@ def _gemini_take_features(wav_bytes: bytes) -> Optional[Dict[str, float]]:
             if w.getsampwidth() != 2:
                 return None
             sr, channels = w.getframerate(), w.getnchannels()
-            x = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float64) / 32768.0
+            raw = w.readframes(w.getnframes())
     except (wave.Error, EOFError):
         return None
+    if sr <= 0 or channels <= 0:
+        return None
+    x = np.frombuffer(raw[: len(raw) - len(raw) % 2], dtype="<i2").astype(np.float64) / 32768.0
     if channels > 1:
         x = x[: len(x) - len(x) % channels].reshape(-1, channels).mean(axis=1)
+    x = x[: sr * 30]  # the first 30 s are enough and keep memory bounded
     n, hop = int(sr * 0.04), int(sr * 0.01)  # 40 ms frames, 10 ms hop
-    if len(x) <= n:
+    if n <= 0 or hop <= 0 or len(x) <= n:
         return None
     frames = np.stack([x[i:i + n] for i in range(0, len(x) - n, hop)])
     rms = np.sqrt((frames ** 2).mean(axis=1))
@@ -2661,23 +2665,36 @@ def _pick_gemini_take(take: Callable[[], bytes], gemini_config: Dict[str, Any]) 
 
     Every Gemini TTS request is a fresh performance; with the same persona some
     takes come out flat and bright. tts.gemini.takes (default 1: one request,
-    no measuring) caps the requests. A take matches when its pitch range is at
-    least take_min_pitch_range_hz and its brightness at most take_max_brightness_hz.
+    no measuring; at most 5) caps the requests. A take matches when its pitch
+    range is at least take_min_pitch_range_hz and its brightness at most
+    take_max_brightness_hz. Measuring is best-effort: if it fails, the audio
+    already in hand is used.
     """
     import requests
 
+    def setting(key: str, default, cast):
+        try:
+            value = cast(gemini_config.get(key, default))
+        except (TypeError, ValueError, OverflowError):
+            return default
+        return value if value > 0 else default
+
     first = take()
-    try:
-        takes = int(gemini_config.get("takes", 1) or 1)
-    except (TypeError, ValueError):
-        takes = 1
-    if takes <= 1 or importlib.util.find_spec("numpy") is None:
+    takes = min(setting("takes", 1, int), 5)
+    if takes <= 1:
         return first
-    min_range = float(gemini_config.get("take_min_pitch_range_hz", 100))
-    max_bright = float(gemini_config.get("take_max_brightness_hz", 1450))
+    if importlib.util.find_spec("numpy") is None:
+        logger.warning("tts.gemini.takes=%d needs numpy; using the first take", takes)
+        return first
+    min_range = setting("take_min_pitch_range_hz", 100.0, float)
+    max_bright = setting("take_max_brightness_hz", 1450.0, float)
 
     def miss(wav: bytes, n: int) -> float:
-        f = _gemini_take_features(wav)
+        try:
+            f = _gemini_take_features(wav)
+        except (ImportError, TypeError, ValueError, ZeroDivisionError) as exc:
+            logger.warning("Gemini TTS take %d/%d: measuring failed (%s)", n, takes, type(exc).__name__)
+            f = None
         if f is None:
             logger.info("Gemini TTS take %d/%d: not measurable", n, takes)
             return float("inf")
@@ -2690,13 +2707,17 @@ def _pick_gemini_take(take: Callable[[], bytes], gemini_config: Dict[str, Any]) 
         return m
 
     best, best_miss = first, miss(first, 1)
+    if best_miss == float("inf"):
+        return first  # cannot measure this audio, so retakes could not be compared
     for n in range(2, takes + 1):
         if best_miss == 0:
             break
         try:
             candidate = take()
-        except (requests.RequestException, RuntimeError) as exc:
-            logger.warning("Gemini TTS take %d/%d failed, keeping the best so far: %s", n, takes, exc)
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            # Our RuntimeErrors carry the HTTP status; request errors can carry the URL (with the key).
+            detail = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__
+            logger.warning("Gemini TTS take %d/%d failed, keeping the best so far: %s", n, takes, detail)
             break
         candidate_miss = miss(candidate, n)
         if candidate_miss < best_miss:

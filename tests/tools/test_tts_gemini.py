@@ -361,3 +361,70 @@ class TestGeminiTakes:
         take, calls = self._takes(flat, RuntimeError("Gemini TTS API error (HTTP 503)"))
         assert _pick_gemini_take(take, {"takes": 3}) == flat
         assert len(calls) == 2
+
+    def test_bad_takes_values_mean_a_single_request(self):
+        from tools.tts_tool import _pick_gemini_take
+
+        flat = _tone_wav(180, 185, tilt=1.5)
+        for bad in ("abc", 0, -2, None, float("inf")):
+            take, calls = self._takes(flat, flat, flat)
+            assert _pick_gemini_take(take, {"takes": bad}) == flat
+            assert len(calls) == 1, bad
+
+    def test_takes_capped_at_five(self):
+        from tools.tts_tool import _pick_gemini_take
+
+        flat = _tone_wav(180, 185, tilt=1.5)
+        take, calls = self._takes(*([flat] * 50))
+        _pick_gemini_take(take, {"takes": 50})
+        assert len(calls) == 5
+
+    def test_bad_thresholds_fall_back_to_defaults(self):
+        from tools.tts_tool import _pick_gemini_take
+
+        lively = _tone_wav(130, 300, tilt=1.5)
+        take, calls = self._takes(lively, lively, lively)
+        cfg = {"takes": 3, "take_min_pitch_range_hz": 0, "take_max_brightness_hz": "loud"}
+        assert _pick_gemini_take(take, cfg) == lively
+        assert len(calls) == 1
+
+    def test_unmeasurable_first_take_is_used_without_retakes(self):
+        from tools.tts_tool import _pick_gemini_take, _wrap_pcm_as_wav
+
+        silence = _wrap_pcm_as_wav(b"\x00\x00" * 48000)
+        odd_bytes = _wrap_pcm_as_wav(b"\x01" * 48001)
+        for first in (silence, odd_bytes, b"not a wav"):
+            take, calls = self._takes(first, first, first)
+            assert _pick_gemini_take(take, {"takes": 3}) == first
+            assert len(calls) == 1
+
+    def test_malformed_retake_keeps_best_so_far(self):
+        from tools.tts_tool import _pick_gemini_take
+
+        flat = _tone_wav(180, 185, tilt=1.5)
+        take, calls = self._takes(flat, ValueError("Expecting value: line 1 column 1"))
+        assert _pick_gemini_take(take, {"takes": 3}) == flat
+        assert len(calls) == 2
+
+    def test_without_numpy_only_one_request(self):
+        import importlib.util
+
+        from tools.tts_tool import _pick_gemini_take
+
+        real_find_spec = importlib.util.find_spec
+        flat = _tone_wav(180, 185, tilt=1.5)
+        take, calls = self._takes(flat, flat, flat)
+        with patch("importlib.util.find_spec", side_effect=lambda name, *a: None if name == "numpy" else real_find_spec(name, *a)):
+            assert _pick_gemini_take(take, {"takes": 3}) == flat
+        assert len(calls) == 1
+
+    def test_generate_gemini_tts_retakes_through_the_api(self, tmp_path, monkeypatch):
+        from tools.tts_tool import _generate_gemini_tts
+
+        monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+        flat, lively = _tone_wav(180, 185, tilt=1.5), _tone_wav(130, 300, tilt=1.5)
+        responses = [_gemini_response_with(flat), _gemini_response_with(lively)]
+        with patch("requests.post", side_effect=responses) as post:
+            _generate_gemini_tts("Hi", str(tmp_path / "t.wav"), {"gemini": {"takes": 3}})
+        assert post.call_count == 2
+        assert (tmp_path / "t.wav").read_bytes() == lively
