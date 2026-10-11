@@ -284,3 +284,80 @@ class TestGeminiVoiceFidelity:
         text = r"路徑 C:\new\1 \g<0>"
         out = _compose_gemini_tts_prompt(text, {"persona_preamble": False}, persona_prompt="A\n{{transcript}}")
         assert out == "A\n" + text
+
+
+def _tone_wav(f0_start, f0_end, tilt, seconds=2.0, sr=24000):
+    """Harmonic tone gliding f0_start -> f0_end Hz; harmonics fall off as 1/k**tilt (higher tilt = darker)."""
+    np = pytest.importorskip("numpy")
+    from tools.tts_tool import _wrap_pcm_as_wav
+
+    t = np.arange(int(sr * seconds))
+    phase = 2 * np.pi * np.cumsum(np.linspace(f0_start, f0_end, t.size)) / sr
+    x = sum(np.sin(k * phase) / k ** tilt for k in range(1, 30))
+    x = 0.3 * x / np.abs(x).max()
+    return _wrap_pcm_as_wav((x * 32767).astype("<i2").tobytes(), sample_rate=sr)
+
+
+class TestGeminiTakes:
+    """tts.gemini.takes: retake flat/bright performances, keep the one closest to the tuned voice."""
+
+    def _takes(self, *wavs):
+        calls = []
+
+        def take():
+            calls.append(1)
+            w = wavs[len(calls) - 1]
+            if isinstance(w, Exception):
+                raise w
+            return w
+
+        return take, calls
+
+    def test_features_tell_lively_from_flat_and_dark_from_bright(self):
+        from tools.tts_tool import _gemini_take_features
+
+        lively = _gemini_take_features(_tone_wav(130, 300, tilt=1.5))
+        flat = _gemini_take_features(_tone_wav(180, 185, tilt=1.5))
+        bright = _gemini_take_features(_tone_wav(180, 185, tilt=0.5))
+        assert lively["pitch_range_hz"] >= 100 > flat["pitch_range_hz"]
+        assert lively["brightness_hz"] <= 1450 < bright["brightness_hz"]
+
+    def test_single_request_by_default(self):
+        from tools.tts_tool import _pick_gemini_take
+
+        flat = _tone_wav(180, 185, tilt=1.5)
+        take, calls = self._takes(flat, flat, flat)
+        assert _pick_gemini_take(take, {}) == flat
+        assert len(calls) == 1
+
+    def test_first_take_kept_when_it_matches(self):
+        from tools.tts_tool import _pick_gemini_take
+
+        lively = _tone_wav(130, 300, tilt=1.5)
+        take, calls = self._takes(lively, lively, lively)
+        assert _pick_gemini_take(take, {"takes": 3}) == lively
+        assert len(calls) == 1
+
+    def test_retakes_until_one_matches(self):
+        from tools.tts_tool import _pick_gemini_take
+
+        flat, lively = _tone_wav(180, 185, tilt=1.5), _tone_wav(130, 300, tilt=1.5)
+        take, calls = self._takes(flat, lively, flat)
+        assert _pick_gemini_take(take, {"takes": 3}) == lively
+        assert len(calls) == 2
+
+    def test_keeps_closest_when_none_match(self):
+        from tools.tts_tool import _pick_gemini_take
+
+        flat, flat_bright = _tone_wav(180, 185, tilt=1.5), _tone_wav(180, 185, tilt=0.5)
+        take, calls = self._takes(flat_bright, flat, flat_bright)
+        assert _pick_gemini_take(take, {"takes": 3}) == flat
+        assert len(calls) == 3
+
+    def test_failed_retake_keeps_best_so_far(self):
+        from tools.tts_tool import _pick_gemini_take
+
+        flat = _tone_wav(180, 185, tilt=1.5)
+        take, calls = self._takes(flat, RuntimeError("Gemini TTS API error (HTTP 503)"))
+        assert _pick_gemini_take(take, {"takes": 3}) == flat
+        assert len(calls) == 2

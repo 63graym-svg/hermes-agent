@@ -2610,6 +2610,100 @@ def _compose_gemini_tts_prompt(
     return f"{preamble}\n\n{persona_prompt}\n\n#### TRANSCRIPT\n{transcript}".strip()
 
 
+def _gemini_take_features(wav_bytes: bytes) -> Optional[Dict[str, float]]:
+    """Pitch range (P90-P10 of F0) and median spectral centroid of a take, in Hz.
+
+    Tells a lively, husky take from a flat, bright one. Returns None when the
+    audio cannot be measured.
+    """
+    import io
+    import wave
+
+    import numpy as np
+
+    try:
+        with wave.open(io.BytesIO(wav_bytes)) as w:
+            if w.getsampwidth() != 2:
+                return None
+            sr, channels = w.getframerate(), w.getnchannels()
+            x = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float64) / 32768.0
+    except (wave.Error, EOFError):
+        return None
+    if channels > 1:
+        x = x[: len(x) - len(x) % channels].reshape(-1, channels).mean(axis=1)
+    n, hop = int(sr * 0.04), int(sr * 0.01)  # 40 ms frames, 10 ms hop
+    if len(x) <= n:
+        return None
+    frames = np.stack([x[i:i + n] for i in range(0, len(x) - n, hop)])
+    rms = np.sqrt((frames ** 2).mean(axis=1))
+    voiced = frames[rms >= max(0.02, float(np.percentile(rms, 60)) * 0.5)]
+    if len(voiced) == 0:
+        return None
+    voiced = voiced - voiced.mean(axis=1, keepdims=True)
+    spec = np.abs(np.fft.rfft(voiced * np.hanning(n), axis=1))
+    freqs = np.fft.rfftfreq(n, 1.0 / sr)
+    brightness = float(np.median((spec * freqs).sum(axis=1) / (spec.sum(axis=1) + 1e-9)))
+    ac = np.fft.irfft(np.abs(np.fft.rfft(voiced, 2 * n, axis=1)) ** 2, axis=1)[:, :n]
+    lo, hi = int(sr / 400), int(sr / 70)  # F0 search range 70-400 Hz
+    lag = lo + ac[:, lo:hi].argmax(axis=1)
+    periodic = ac[np.arange(len(lag)), lag] > 0.3 * ac[:, 0]
+    if periodic.sum() < 10:
+        return None
+    f0 = sr / lag[periodic]
+    return {
+        "pitch_range_hz": float(np.percentile(f0, 90) - np.percentile(f0, 10)),
+        "brightness_hz": brightness,
+    }
+
+
+def _pick_gemini_take(take: Callable[[], bytes], gemini_config: Dict[str, Any]) -> bytes:
+    """Return the first take that matches the tuned delivery, else the closest one.
+
+    Every Gemini TTS request is a fresh performance; with the same persona some
+    takes come out flat and bright. tts.gemini.takes (default 1: one request,
+    no measuring) caps the requests. A take matches when its pitch range is at
+    least take_min_pitch_range_hz and its brightness at most take_max_brightness_hz.
+    """
+    import requests
+
+    first = take()
+    try:
+        takes = int(gemini_config.get("takes", 1) or 1)
+    except (TypeError, ValueError):
+        takes = 1
+    if takes <= 1 or importlib.util.find_spec("numpy") is None:
+        return first
+    min_range = float(gemini_config.get("take_min_pitch_range_hz", 100))
+    max_bright = float(gemini_config.get("take_max_brightness_hz", 1450))
+
+    def miss(wav: bytes, n: int) -> float:
+        f = _gemini_take_features(wav)
+        if f is None:
+            logger.info("Gemini TTS take %d/%d: not measurable", n, takes)
+            return float("inf")
+        m = (max(0.0, min_range - f["pitch_range_hz"]) / min_range
+             + max(0.0, f["brightness_hz"] - max_bright) / max_bright)
+        logger.info(
+            "Gemini TTS take %d/%d: pitch range %.0f Hz, brightness %.0f Hz, miss %.3f",
+            n, takes, f["pitch_range_hz"], f["brightness_hz"], m,
+        )
+        return m
+
+    best, best_miss = first, miss(first, 1)
+    for n in range(2, takes + 1):
+        if best_miss == 0:
+            break
+        try:
+            candidate = take()
+        except (requests.RequestException, RuntimeError) as exc:
+            logger.warning("Gemini TTS take %d/%d failed, keeping the best so far: %s", n, takes, exc)
+            break
+        candidate_miss = miss(candidate, n)
+        if candidate_miss < best_miss:
+            best, best_miss = candidate, candidate_miss
+    return best
+
+
 def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
     """Generate audio using Google Gemini TTS.
 
@@ -2691,49 +2785,53 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
         headers["X-Goog-Api-Client"] = f"hermes-agent/{_hermes_version}"
 
     endpoint = f"{base_url}/models/{model}:generateContent"
-    response = requests.post(
-        endpoint,
-        params={"key": api_key},
-        headers=headers,
-        json=payload,
-        timeout=60,
-        stream=True,
-    )
-    if response.status_code != 200:
-        # Surface the API error message when present
-        raw_body = _read_tts_response_bytes(response, label="Gemini TTS")
-        try:
-            if raw_body:
-                err = json.loads(raw_body.decode("utf-8")).get("error", {})
-            elif not _response_has_explicit_stream(response) and callable(getattr(response, "json", None)):
-                err = response.json().get("error", {})
-            else:
-                err = {}
-            detail = err.get("message") or raw_body.decode("utf-8", errors="replace")[:300]
-        except Exception:
-            detail = raw_body.decode("utf-8", errors="replace")[:300]
-        raise RuntimeError(
-            f"Gemini TTS API error (HTTP {response.status_code}): {detail}"
+
+    def _take() -> bytes:
+        response = requests.post(
+            endpoint,
+            params={"key": api_key},
+            headers=headers,
+            json=payload,
+            timeout=60,
+            stream=True,
         )
+        if response.status_code != 200:
+            # Surface the API error message when present
+            raw_body = _read_tts_response_bytes(response, label="Gemini TTS")
+            try:
+                if raw_body:
+                    err = json.loads(raw_body.decode("utf-8")).get("error", {})
+                elif not _response_has_explicit_stream(response) and callable(getattr(response, "json", None)):
+                    err = response.json().get("error", {})
+                else:
+                    err = {}
+                detail = err.get("message") or raw_body.decode("utf-8", errors="replace")[:300]
+            except Exception:
+                detail = raw_body.decode("utf-8", errors="replace")[:300]
+            raise RuntimeError(
+                f"Gemini TTS API error (HTTP {response.status_code}): {detail}"
+            )
 
-    try:
-        data = _read_tts_response_json(response, label="Gemini TTS")
-        parts = data["candidates"][0]["content"]["parts"]
-        audio_part = next((p for p in parts if "inlineData" in p or "inline_data" in p), None)
-        if audio_part is None:
-            raise RuntimeError("Gemini TTS response contained no audio data")
-        inline = audio_part.get("inlineData") or audio_part.get("inline_data") or {}
-        audio_b64 = inline.get("data", "")
-    except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(f"Gemini TTS response was malformed: {e}") from e
+        try:
+            data = _read_tts_response_json(response, label="Gemini TTS")
+            parts = data["candidates"][0]["content"]["parts"]
+            audio_part = next((p for p in parts if "inlineData" in p or "inline_data" in p), None)
+            if audio_part is None:
+                raise RuntimeError("Gemini TTS response contained no audio data")
+            inline = audio_part.get("inlineData") or audio_part.get("inline_data") or {}
+            audio_b64 = inline.get("data", "")
+        except (KeyError, IndexError, TypeError) as e:
+            raise RuntimeError(f"Gemini TTS response was malformed: {e}") from e
 
-    if not audio_b64:
-        raise RuntimeError("Gemini TTS returned empty audio data")
+        if not audio_b64:
+            raise RuntimeError("Gemini TTS returned empty audio data")
 
-    pcm_bytes = base64.b64decode(audio_b64)
-    # Newer Gemini TTS models already return a complete WAV (with a trailing
-    # C2PA chunk); wrapping it again plays that metadata as noise at the end.
-    wav_bytes = pcm_bytes if pcm_bytes[:4] == b"RIFF" else _wrap_pcm_as_wav(pcm_bytes)
+        pcm_bytes = base64.b64decode(audio_b64)
+        # Newer Gemini TTS models already return a complete WAV (with a trailing
+        # C2PA chunk); wrapping it again plays that metadata as noise at the end.
+        return pcm_bytes if pcm_bytes[:4] == b"RIFF" else _wrap_pcm_as_wav(pcm_bytes)
+
+    wav_bytes = _pick_gemini_take(_take, gemini_config)
 
     # Fast path: caller wants WAV directly, just write.
     if output_path.lower().endswith(".wav"):
